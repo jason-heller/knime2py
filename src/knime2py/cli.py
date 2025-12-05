@@ -77,6 +77,18 @@ from .emitters import (
     build_workbook_blocks,
 )
 
+def _resolve_metanode_paths(root_path: Path) -> list[Path]:
+    """
+    Returns all subdirectories containing metanodes
+    
+    :param path: The parent directory
+    :type path: Path
+    :return: A list of paths containing nodes
+    :rtype: list[Path]
+    """
+    out_list = list({parent_path for parent_path in root_path.rglob('workflow.knime')})
+
+    return out_list
 
 def _resolve_single_workflow(path: Path) -> Path:
     """
@@ -109,11 +121,11 @@ def _resolve_single_workflow(path: Path) -> Path:
         return p
 
     # Directory: only accept a workflow.knime directly inside it (no recursion)
-    wf = p / "workflow.knime"
-    if not wf.exists() or not wf.is_file():
+    wf_path = p / "workflow.knime"
+    if not wf_path.exists() or not wf_path.is_file():
         print(f"No workflow.knime found in directory: {p}", file=sys.stderr)
         raise SystemExit(2)
-    return wf
+    return wf_path
 
 
 def run_cli(argv: Optional[list[str]] = None) -> int:
@@ -150,18 +162,45 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
 
     args = p.parse_args(argv)
 
-    wf = _resolve_single_workflow(args.path)
+    # TODO: Since we walk the directory for metanodes, we dont need to seek
+    # for singular knime.workflow files anymore, this should be removed
+    # as it creates redundancy with _resolve_metanode_paths
+    wf_root_file = _resolve_single_workflow(args.path) 
+    wf_root_path = _resolve_single_workflow(args.path).parent
+
+    # All paths where nodes live
+    wf_paths = _resolve_metanode_paths(wf_root_path)
+
     out_dir = args.out.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if len(wf_paths) == 0:
+        print(f"No paths found to convert in {wf_root_path}")
+
+    if len(wf_paths) > 1:
+        metanode_path = out_dir.joinpath("metanodes")
+        metanode_path.mkdir(parents=True, exist_ok=True)
+        print(f"Creating metanode path {metanode_path}")
+
+    for wf_path in wf_paths:
+        is_root = wf_root_file == wf_path
+        if is_root:
+            print(f"Converting {wf_path.parent.name}")
+
+        convert_path(args, wf_path, out_dir, is_root)
+    
+    return 0
+
+def convert_path(args, wf_path: Path, out_dir, is_root):
     try:
-        graphs = parse_workflow_components(wf)  # one WorkflowGraph per isolated component
+        graphs = parse_workflow_components(wf_path)  # one WorkflowGraph per isolated component
     except Exception as e:
-        print(f"ERROR parsing {wf}: {e}", file=sys.stderr)
+        print(f"ERROR parsing {wf_path}: {e}", file=sys.stderr)
         return 3
 
-    if not graphs:
-        print(f"No nodes/edges found in workflow: {wf}", file=sys.stderr)
+    # Okay for metanodes (not root) to be empty
+    if not graphs and is_root:
+        print(f"No nodes/edges found in workflow: {wf_path}", file=sys.stderr)
         return 4
 
     components = []
@@ -196,10 +235,14 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
                 not_impl_names.add(f"{title} ({factory})")
 
         # Workbooks
+        wf_name = wf_path.parent.name
+        if not is_root:
+            wf_name = "metanodes/" + wf_name
+
         if args.workbook in (None, "py"):
-            wb_py = write_workbook_py(g, out_dir, blocks, imports)
+            wb_py = write_workbook_py(g, wf_name, out_dir, blocks, imports)
         if args.workbook in (None, "ipynb"):
-            wb_ipynb = write_workbook_ipynb(g, out_dir, blocks, imports)
+            wb_ipynb = write_workbook_ipynb(g, wf_name, out_dir, blocks, imports)
 
         components.append(
             {
@@ -217,13 +260,11 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
         )
 
     summary = {
-        "workflow": str(wf),
+        "workflow": str(wf_path),
         "total_components": len(components),
         "components": components,
     }
-    print(json.dumps(summary, indent=2))
-    return 0
-
+    # print(json.dumps(summary, indent=2))
 
 def main(argv: Optional[list[str]] = None) -> None:
     """

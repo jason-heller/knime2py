@@ -81,7 +81,7 @@ from pathlib import Path
 from typing import List, Optional
 import re
 
-from .traverse import derive_title_and_root, traverse_nodes
+from .traverse import derive_node_metadata, traverse_nodes
 from knime2py.nodes.registry import get_handlers
 
 __all__ = [
@@ -91,6 +91,8 @@ __all__ = [
     "write_workbook_py",
     "write_workbook_ipynb",
 ]
+
+__metanode_imports__ = ["import subprocess"]
 
 
 @dataclass
@@ -102,6 +104,7 @@ class NodeBlock:
 
     # export coverage flag: True iff NO dedicated exporter exists
     not_implemented: bool
+    is_metanode: bool
 
     # state & summaries (already formatted one-liners)
     state: str
@@ -117,6 +120,7 @@ class NodeBlock:
     loop_role: Optional[str] = None  # "start" | "finish" | None
 
 
+
 # ----------------------------
 # Shared helpers
 # ----------------------------
@@ -130,7 +134,7 @@ def _title_for_neighbor(g, nei_id: str) -> str:
     nn = g.nodes.get(nei_id)
     if not nn:
         return nei_id
-    t, _ = derive_title_and_root(nei_id, nn)
+    t, _a, _b = derive_node_metadata(nei_id, nn)
     return t
 
 
@@ -232,8 +236,8 @@ def write_graph_dot(g, out_dir: Path) -> Path:
 
     # Nodes
     for nid, n in g.nodes.items():
-        title, root_id = derive_title_and_root(nid, n)
-        parts = [title, root_id]
+        title, root_id, is_metanode = derive_node_metadata(nid, n)
+        parts = [title, root_id, is_metanode]
         if getattr(n, "comments", None):
             parts.append(str(n.comments))
         label = _esc("\n".join(parts))
@@ -286,8 +290,12 @@ def build_workbook_blocks(g) -> tuple[list["NodeBlock"], list[str]]:
         root_id = ctx["root_id"]
         state = (ctx["state"] or "UNKNOWN").upper()
         comments = ctx["comments"]
+        is_metanode = ctx["is_metanode"]
         incoming = ctx["incoming"]
         outgoing = ctx["outgoing"]
+
+        # Match to Knime's file export name
+        file_title = title[:12].strip() + " (#" + nid + ")_workbook"
 
         # Determine exporter presence (coverage): dedicated handler only
         factory = getattr(n, "type", None)
@@ -333,31 +341,35 @@ def build_workbook_blocks(g) -> tuple[list["NodeBlock"], list[str]]:
             code_lines.append("# The node is IDLE. Codegen is not possible. Implement this node manually or run the node in KNIME.")
             code_lines.append("pass")
         else:
-            # Prefer dedicated handler; otherwise fall back to default for codegen convenience
-            mod = specific_mod or default_mod
-            res = None
-            if mod is not None:
-                try:
-                    res = mod.handle(factory, nid, n.path, incoming, outgoing)
-                except Exception as e:
-                    import sys as _sys
-                    print(f"[emitters] Handler {getattr(mod, '__name__', mod)} failed on node {nid}: {e}", file=_sys.stderr)
-                    res = None
-
-            if res:
-                found_imports, body = res
-                if found_imports:
-                    aggregated_imports.update(found_imports)
-                if body:
-                    code_lines.extend(body)
+            if is_metanode:
+                aggregated_imports.update(__metanode_imports__)
+                code_lines.append(f"""subprocess.run(["python", "metanodes/{file_title}.py"])""")
             else:
-                if factory:
-                    hub_url = f"https://hub.knime.com/knime/extensions/org.knime.features.base/latest/{factory}"
-                    code_lines.append(f"# {hub_url}")
+                # Prefer dedicated handler; otherwise fall back to default for codegen convenience
+                mod = specific_mod or default_mod
+                res = None
+                if mod is not None:
+                    try:
+                        res = mod.handle(factory, nid, n.path, incoming, outgoing)
+                    except Exception as e:
+                        import sys as _sys
+                        print(f"[emitters] Handler {getattr(mod, '__name__', mod)} failed on node {nid}: {e}", file=_sys.stderr)
+                        res = None
+
+                if res:
+                    found_imports, body = res
+                    if found_imports:
+                        aggregated_imports.update(found_imports)
+                    if body:
+                        code_lines.extend(body)
                 else:
-                    code_lines.append("# Factory class unavailable")
-                code_lines.append("# TODO: implement this node")
-                code_lines.append("pass")
+                    if factory:
+                        hub_url = f"https://hub.knime.com/knime/extensions/org.knime.features.base/latest/{factory}"
+                        code_lines.append(f"# {hub_url}")
+                    else:
+                        code_lines.append("# Factory class unavailable")
+                    code_lines.append("# TODO: implement this node")
+                    code_lines.append("pass")
 
         # Loop role—use the handler that defines LOOP, preferring the dedicated one
         mod_for_role = specific_mod or default_mod
@@ -388,6 +400,7 @@ def build_workbook_blocks(g) -> tuple[list["NodeBlock"], list[str]]:
             "not_impl_flag": (not has_dedicated_exporter),
             "indent_prefix": indent_prefix,
             "loop_role": loop_role,
+            "is_metanode": is_metanode,
         })
 
         # update indent AFTER placing current node
@@ -410,6 +423,7 @@ def build_workbook_blocks(g) -> tuple[list["NodeBlock"], list[str]]:
             code_lines=p["code_lines"],
             indent_prefix=p.get("indent_prefix", ""),
             loop_role=p.get("loop_role"),
+            is_metanode=p["is_metanode"],
         ))
 
     return blocks, sorted(aggregated_imports)
@@ -420,6 +434,7 @@ def build_workbook_blocks(g) -> tuple[list["NodeBlock"], list[str]]:
 # ----------------------------
 def write_workbook_py(
     g,
+    path_name,
     out_dir: Path,
     blocks: Optional[List[NodeBlock]] = None,
     imports: Optional[List[str]] = None,
@@ -436,7 +451,7 @@ def write_workbook_py(
         The path to the created .py file.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    fp = out_dir / f"{g.workflow_id}_workbook.py"
+    fp = out_dir / f"{path_name}_workbook.py"
 
     if blocks is None or imports is None:
         blocks, imports = build_workbook_blocks(g)
@@ -480,20 +495,25 @@ def write_workbook_py(
     lines.append("")
 
     for b in blocks:
-        lines.extend(_banner_lines(b))
-        if not b.code_lines:
-            lines.append((b.indent_prefix or "") + "# TODO: implement this node")
-            lines.append((b.indent_prefix or "") + "pass")
-        else:
-            lines.extend(b.code_lines)
-        lines.append("")
+        # Skip empty metanodes - Some people make these as relays.
+        if not (b.is_metanode and not b.code_lines):
+            lines.extend(_banner_lines(b))
 
-    fp.write_text("\n".join(lines), encoding='utf-8')
+            if not b.code_lines:
+                lines.append((b.indent_prefix or "") + "# TODO: implement this node")
+                lines.append((b.indent_prefix or "") + "pass")
+            else:
+                lines.extend(b.code_lines)
+                
+            lines.append("")
+
+            fp.write_text("\n".join(lines), encoding='utf-8')
     return fp
 
 
 def write_workbook_ipynb(
     g,
+    path_name,
     out_dir: Path,
     blocks: Optional[List[NodeBlock]] = None,
     imports: Optional[List[str]] = None,
@@ -510,7 +530,7 @@ def write_workbook_ipynb(
         The path to the created .ipynb file.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    fp = out_dir / f"{g.workflow_id}_workbook.ipynb"
+    fp = out_dir / f"{path_name}_workbook.ipynb"
 
     if blocks is None or imports is None:
         blocks, imports = build_workbook_blocks(g)

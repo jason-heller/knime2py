@@ -84,7 +84,7 @@ from typing import Dict, Iterable, Iterator, List, Tuple
 __all__ = [
     "depth_order",
     "traverse_nodes",
-    "derive_title_and_root"
+    "derive_node_metadata"
 ]
 
 def _id_sort_key(s: str) -> Tuple[int, str]:
@@ -193,7 +193,7 @@ def depth_order(nodes: Dict[str, object], edges: Iterable) -> List[str]:
     return order
 
 
-def derive_title_and_root(nid: str, n) -> tuple[str, str]:
+def derive_node_metadata(nid: str, n) -> tuple[str, str]:
     """
     Derive the title and root ID from a node.
 
@@ -209,9 +209,12 @@ def derive_title_and_root(nid: str, n) -> tuple[str, str]:
     """
     root_id = nid
     title = None
+    is_metanode = False
     if getattr(n, "path", None):
-        base = Path(n.path).name  # e.g. "CSV Reader (#1)"
+        path = Path(n.path)
+        base = path.name  # e.g. "CSV Reader (#1)"
         m = re.match(r"^(.*?)\s*\(#(\d+)\)\s*$", base)
+        is_metanode = Path(path / "workflow.knime").exists()
         if m:
             title = m.group(1)
             root_id = m.group(2)
@@ -222,7 +225,7 @@ def derive_title_and_root(nid: str, n) -> tuple[str, str]:
             title = n.type.rsplit(".", 1)[-1]  # short class name
         else:
             title = f"node_{nid}"
-    return title, root_id
+    return title, root_id, is_metanode
 
 
 def traverse_nodes(g) -> Iterator[dict]:
@@ -243,7 +246,7 @@ def traverse_nodes(g) -> Iterator[dict]:
 
     for nid in order:
         n = g.nodes[nid]
-        title, root_id = derive_title_and_root(nid, n)
+        title, root_id, is_metanode = derive_node_metadata(nid, n)
         state = getattr(n, "state", None)
         comments = getattr(n, "comments", None)
 
@@ -261,5 +264,6 @@ def traverse_nodes(g) -> Iterator[dict]:
             "comments": comments,
             "incoming": incoming,
             "outgoing": outgoing,
+            "is_metanode": is_metanode
         }
 
